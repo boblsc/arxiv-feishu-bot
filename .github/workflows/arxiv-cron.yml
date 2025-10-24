@@ -2,7 +2,7 @@ name: Daily arXiv push to Feishu
 
 on:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -28,7 +28,7 @@ jobs:
           DAYS: "1"
           MAX_RESULTS: "20"
           TOP_SEND: "5"
-          ARXIV_QUERY: "(dark matter) OR neutrino"
-          ARXIV_CAT: ""
+          ARXIV_QUERY: ${{ secrets.ARXIV_QUERY }}
+          ARXIV_CAT: ${{ secrets.ARXIV_CAT }}
         run: |
           python arxiv_to_feishu.py
