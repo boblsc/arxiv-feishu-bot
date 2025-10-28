@@ -26,17 +26,20 @@ jobs:
 
       - name: Push to Feishu
         env:
-          # 必填：从仓库 Settings → Secrets and variables → Actions 添加
           WEBHOOK_URL:        ${{ secrets.FEISHU_WEBHOOK_URL }}
-          ARXIV_QUERY:        ${{ secrets.ARXIV_QUERY }}          # 例：dark matter OR neutrino OR TPC OR xenon OR argon OR WIMP OR CEvNS
-          ARXIV_CLASSES:      ${{ secrets.ARXIV_CLASSES }}        # 例：hep-th,hep-ex,hep-ph,nucl-ex,physics.ins-det
-
-          # 可选：不设则用脚本默认
-          REQUIRE_PHYSICS_GROUP: "1"       # 1=同时要求 classification:physics
-          RESULT_SIZE: "50"                # 网页每页数量（上限 200）
-          ORDER: "-announced_date_first"   # 网页排序
-          HIDE_ABSTRACTS: "True"           # 隐藏摘要
-          TOP_SEND: "10"                   # 实际推送条数上限
-          DAYS: "0"                        # 0=不限时间；1=仅最近一天
+          ARXIV_QUERY:        ${{ secrets.ARXIV_QUERY }}          # 你的关键词集合
+          ARXIV_CLASSES:      ${{ secrets.ARXIV_CLASSES }}        # 例如：hep-th,hep-ex,hep-ph,nucl-ex,physics.ins-det
+        
+          REQUIRE_PHYSICS_GROUP: "1"
+          RESULT_SIZE: "50"
+          ORDER: "-announced_date_first"
+        
+          # 关键：要摘要 + 只当天
+          HIDE_ABSTRACTS: "False"
+          TODAY_ONLY: "1"
+          LOCAL_TZ: "America/Los_Angeles"
+        
+          TOP_SEND: "10"
+          DAYS: "0"   # TODAY_ONLY 已经满足当天，这里保持 0
         run: |
           python arxiv_to_feishu.py
