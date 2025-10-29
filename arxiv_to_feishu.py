@@ -1,38 +1,49 @@
-# arxiv_to_feishu.py  (web-search + classification + today-only + abstracts)
+# arxiv_to_feishu.py
+# Mode: web search (classification) + latest-day-only + abstracts + early-stop
+# Requires: pip install requests beautifulsoup4
+
 import os
-import sys
 import re
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime
 from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
 
-# ===== 环境变量（不要加引号）=====
-WEBHOOK_URL   = os.getenv("WEBHOOK_URL")                        # 必填：飞书 Incoming Webhook
-ARXIV_QUERY   = os.getenv("ARXIV_QUERY", "dark matter OR neutrino OR TPC OR xenon OR argon OR WIMP OR CEvNS")
-ARXIV_CLASSES = os.getenv("ARXIV_CLASSES", "hep-th,hep-ex,hep-ph,nucl-ex,physics.ins-det")
-REQUIRE_PHYSICS_GROUP = os.getenv("REQUIRE_PHYSICS_GROUP", "1") in ("1","true","True","YES","yes")
+# ===== Environment (values should be raw text, no quotes) =====
+WEBHOOK_URL   = os.getenv("WEBHOOK_URL")  # REQUIRED: Feishu Incoming Webhook
 
-# 网页参数
-RESULT_SIZE   = int(os.getenv("RESULT_SIZE", "50"))
-ORDER         = os.getenv("ORDER", "-announced_date_first")
-# 要“包含摘要”：把 HIDE_ABSTRACTS 设为 False（或删掉这个 env）
-HIDE_ABSTRACTS = os.getenv("HIDE_ABSTRACTS", "False") in ("1","true","True","YES","yes")
+# Query terms (classification syntax on arxiv.org/search)
+ARXIV_QUERY   = os.getenv(
+    "ARXIV_QUERY",
+    "dark matter OR neutrino OR TPC OR xenon OR argon OR WIMP OR CEvNS",
+)
+# Comma/space-separated classes (auto-prefixed with classification:)
+ARXIV_CLASSES = os.getenv(
+    "ARXIV_CLASSES",
+    "hep-th,hep-ex,hep-ph,nucl-ex,physics.ins-det",
+)
+# Also require physics group?
+REQUIRE_PHYSICS_GROUP = os.getenv("REQUIRE_PHYSICS_GROUP", "1").lower() in ("1","true","yes")
 
-# 业务控制
-TOP_SEND    = int(os.getenv("TOP_SEND", "10"))
-DAYS        = int(os.getenv("DAYS", "0"))            # 0=不限；>0=最近N天（仅当 TODAY_ONLY=0 时使用）
-TODAY_ONLY  = os.getenv("TODAY_ONLY", "1") in ("1","true","True","YES","yes")
-LOCAL_TZ    = os.getenv("LOCAL_TZ", "America/Los_Angeles")
+# Search page params
+RESULT_SIZE = int(os.getenv("RESULT_SIZE", "200"))          # one page; 200 fits a full batch
+ORDER       = os.getenv("ORDER", "-announced_date_first")   # newest announced first
+# We need abstracts → set to False (show)
+HIDE_ABSTRACTS = os.getenv("HIDE_ABSTRACTS", "False").lower() in ("1","true","yes")
+
+# Message shaping
+TOP_SEND = int(os.getenv("TOP_SEND", "10"))  # limit messages sent to Feishu
 
 SEARCH_BASE = "https://arxiv.org/search/"
 
+
+# ---------- Query construction ----------
 def _normalize_class_tokens(raw: str):
-    toks = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
+    """Normalize 'hep-ex, hep-ph' → ['classification:hep-ex', 'classification:hep-ph', ...]"""
+    tokens = [t.strip() for t in re.split(r"[,\s]+", raw) if t.strip()]
     out, seen = [], set()
-    for t in toks:
+    for t in tokens:
         if not t.startswith("classification:"):
             t = f"classification:{t}"
         if t not in seen:
@@ -59,23 +70,64 @@ def build_search_url(q: str, size: int, order: str, hide_abs: bool) -> str:
     qs = "&".join([f"{k}={quote_plus(v)}" for k, v in params])
     return f"{SEARCH_BASE}?{qs}"
 
+
+# ---------- Parsing helpers ----------
+def _extract_announced_date(li: BeautifulSoup):
+    """
+    Extract date from a result item, e.g. "announced on Month DD, YYYY" or "Submitted on ..."
+    Returns date() or None.
+    """
+    date_text = ""
+    for p in li.select("p.is-size-7"):
+        t = p.get_text(" ", strip=True)
+        if "announced" in t or "Submitted" in t:
+            date_text = t
+            break
+    m = re.search(r"(announced|Submitted)\s+on\s+([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})", date_text)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(2), "%B %d, %Y").date()
+    except Exception:
+        return None
+
 def _extract_abstract(li: BeautifulSoup) -> str:
-    # 把网页显示的“摘要”抓出来（abstracts=show 时才有）
-    node = li.select_one("span.abstract-full")
-    if not node:
-        node = li.select_one("p.abstract") or li.select_one("span.abstract-short")
+    """
+    Abstract is present only when abstracts=show.
+    Try several containers, clean minor artifacts.
+    """
+    node = (li.select_one("span.abstract-full")
+            or li.select_one("p.abstract")
+            or li.select_one("span.abstract-short"))
     if not node:
         return ""
     txt = node.get_text(" ", strip=True)
-    # 去除可能出现的前缀 “Abstract:” 或折叠控件残留字符
     txt = re.sub(r"^\s*Abstract:\s*", "", txt, flags=re.I)
     txt = re.sub(r"\s*(Show less|△ Less|▽ More)\s*$", "", txt, flags=re.I)
     return txt.strip()
 
-def parse_results(html_text: str):
+
+# ---------- Core: parse only latest day (early-stop) ----------
+def parse_results_only_latest_day(html_text: str):
+    """
+    Parse just enough to collect results from the latest announced day.
+    Assumes page sorted by -announced_date_first.
+    Stops as soon as it encounters an item from a different date.
+    """
     soup = BeautifulSoup(html_text, "html.parser")
     items = []
+    latest_date = None
+
     for li in soup.select("li.arxiv-result"):
+        d = _extract_announced_date(li)
+        # Set the target date based on the first item that has a date
+        if d and latest_date is None:
+            latest_date = d
+
+        # If we know the latest_date and this item is older → stop
+        if latest_date is not None and d is not None and d != latest_date:
+            break
+
         title_tag = li.select_one("p.title")
         title = title_tag.get_text(strip=True) if title_tag else ""
 
@@ -93,78 +145,42 @@ def parse_results(html_text: str):
             abs_link = "https://arxiv.org" + abs_link
         if pdf_link and not pdf_link.startswith("http"):
             pdf_link = "https://arxiv.org" + pdf_link
+        if not pdf_link and abs_link and "/abs/" in abs_link:
+            pdf_link = abs_link.replace("/abs/", "/pdf/") + ".pdf"
 
-        # 主分类 tag
-        cat = ""
-        tag = li.select_one("span.tag")
-        if tag:
-            cat = tag.get_text(strip=True)
-
-        # announced 日期（只有日期，无时间）
-        date_text = ""
-        for p in li.select("p.is-size-7"):
-            t = p.get_text(" ", strip=True)
-            if "announced" in t or "Submitted" in t:
-                date_text = t
-                break
-        dt_date = None
-        # 解析 "announced on Month DD, YYYY" 或 "Submitted on Month DD, YYYY"
-        m = re.search(r"(announced|Submitted)\s+on\s+([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})", date_text)
-        if m:
-            try:
-                dt_date = datetime.strptime(m.group(2), "%B %d, %Y").date()
-            except Exception:
-                dt_date = None
-
+        cat = li.select_one("span.tag").get_text(strip=True) if li.select_one("span.tag") else ""
         abstract = _extract_abstract(li)
 
         items.append({
             "title": title,
             "authors": authors,
-            "abs": abs_link,
-            "pdf": pdf_link,
+            "abs": abs_link or "",
+            "pdf": pdf_link or "",
             "cat": cat,
-            "announced_date": dt_date,   # 仅 date()
+            "announced_date": d,   # may be None for some entries
             "abstract": abstract,
         })
+
     return items
 
-def filter_today(items, tz_name: str):
-    # “当天”按用户本地时区的“日历日”来判定
-    today_local = datetime.now(ZoneInfo(tz_name)).date()
-    return [it for it in items if it.get("announced_date") == today_local]
 
-def filter_by_days(items, days: int, tz_name: str):
-    if days <= 0:
-        return items
-    # 用本地时区的“今天减 days-1 天”为最早日
-    now_local = datetime.now(ZoneInfo(tz_name)).date()
-    earliest = now_local  # days==1 → 只今天；days==2 → 今天/昨天
-    if days > 1:
-        from datetime import timedelta
-        earliest = now_local - timedelta(days=days-1)
-    out = []
-    for it in items:
-        d = it.get("announced_date")
-        if d is None or d >= earliest:
-            out.append(it)
-    return out
-
+# ---------- Feishu card ----------
 def build_card(items):
     if not items:
-        content = "没有符合条件的结果。"
+        content = "没有符合条件的结果（最新批次为空）。"
     else:
         lines = []
         for i, it in enumerate(items, 1):
             title = it["title"]
             authors = it["authors"]
             cat = it.get("cat", "")
-            absu = it.get("abs") or ""
-            pdfu = it.get("pdf") or (absu.replace("/abs/", "/pdf/") + ".pdf" if "/abs/" in absu else "")
+            absu = it.get("abs", "")
+            pdfu = it.get("pdf", "")
             date_str = it["announced_date"].isoformat() if it.get("announced_date") else ""
             abstract = (it.get("abstract") or "").strip()
-            if len(abstract) > 600:
-                abstract = abstract[:600] + " …"
+            if len(abstract) > 700:  # keep messages compact
+                abstract = abstract[:700] + " …"
+
             head = f"**{i}. {title}**"
             meta = f"作者：{authors}"
             extras = []
@@ -174,11 +190,18 @@ def build_card(items):
                 extras.append(f"类别：`{cat}`")
             if extras:
                 meta += "  |  " + "  |  ".join(extras)
+
+            links = ""
+            if absu:
+                links += f"[abs]({absu})"
+            if pdfu:
+                links += ("  |  " if links else "") + f"[pdf]({pdfu})"
+
             lines += [
                 head,
                 meta,
                 abstract if abstract else "_(no abstract on list page)_",
-                f"[abs]({absu})  |  [pdf]({pdfu})",
+                links,
                 ""
             ]
         content = "\n\n".join(lines)
@@ -188,7 +211,7 @@ def build_card(items):
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "arXiv 当日更新（含摘要）"},
+                "title": {"tag": "plain_text", "content": "arXiv 最新批次（含摘要）"},
                 "template": "blue"
             },
             "elements": [
@@ -197,37 +220,33 @@ def build_card(items):
         }
     }
 
-def post_to_feishu(payload):
-    r = requests.post(WEBHOOK_URL, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
 
+# ---------- Runner ----------
 def main():
     if not WEBHOOK_URL:
-        print("缺少 WEBHOOK_URL（飞书 Webhook）。", file=sys.stderr)
-        sys.exit(2)
+        print("Missing WEBHOOK_URL (Feishu Incoming Webhook).", flush=True)
+        raise SystemExit(2)
 
-    query = build_web_query(ARXIV_QUERY, ARXIV_CLASSES, REQUIRE_PHYSICS_GROUP)
-    url = build_search_url(query, RESULT_SIZE, ORDER, HIDE_ABSTRACTS)
+    # Build query strictly with classification:
+    full_query = build_web_query(ARXIV_QUERY, ARXIV_CLASSES, REQUIRE_PHYSICS_GROUP)
+    url = build_search_url(full_query, RESULT_SIZE, ORDER, HIDE_ABSTRACTS)
 
     headers = {"User-Agent": "Mozilla/5.0 (arxiv-feishu-bot; classification-search)"}
     resp = requests.get(url, headers=headers, timeout=40)
     resp.raise_for_status()
 
-    items = parse_results(resp.text)
-
-    if TODAY_ONLY:
-        items = filter_today(items, LOCAL_TZ)
-    elif DAYS > 0:
-        items = filter_by_days(items, DAYS, LOCAL_TZ)
-
+    # Parse only the newest announced day (early-stop)
+    items = parse_results_only_latest_day(resp.text)
     to_send = items[:TOP_SEND]
-    payload = build_card(to_send)
-    r = post_to_feishu(payload)
 
-    print("Feishu response:", r)
+    payload = build_card(to_send)
+    r = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+    r.raise_for_status()
+
+    print("Feishu response:", r.text)
     print(f"URL used: {url}")
-    print(f"Found {len(items)} items after filter; sent {len(to_send)}.")
+    print(f"Found {len(items)} items (latest day only); sent {len(to_send)}.")
+
 
 if __name__ == "__main__":
     main()
