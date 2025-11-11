@@ -8,11 +8,6 @@ Results are scraped from [arxiv.org/search](https://arxiv.org/search) using the 
 
 ## 🚀 Features
 
-✅ Uses **classification filters** (e.g., `hep-ex`, `hep-ph`, `nucl-ex`) — no cross-listing from `gr-qc`, `astro-ph`, etc.
-✅ Sends only **the most recent arXiv announcements** within a configurable window（默认最近 7 天）。
-✅ Fans out keywords so **each query runs independently**, 确保分类过滤清晰。
-✅ Includes **abstracts**, authors, categories, and links (`abs` / `pdf`).
-✅ Runs automatically via **GitHub Actions** (weekly Monday schedule) — now with a **local dry-run mode** for quick verification.
 ✅ Fully configurable via repository **Secrets** and **Environment Variables**.
 
 ---
@@ -64,13 +59,12 @@ Update `.github/workflows/arxiv-cron.yml` to set your keyword矩阵与运行频�
 | Variable | Default | Description |
 |-----------|----------|-------------|
 | `RESULT_SIZE` | `200` | Number of entries fetched from arXiv search |
-| `TOP_SEND` | `0` | Max papers sent to Feishu or printed in dry-run (`0` = 不限制) |
 | `ORDER` | `-announced_date_first` | Sort order on arXiv |
 | `HIDE_ABSTRACTS` | `False` | Whether to hide abstracts on arXiv search page |
 | `REQUIRE_PHYSICS_GROUP` | `1` | Restrict to physics main group in classification |
 | `DRY_RUN` | `0` | When truthy, only prints summary instead of pushing to Feishu |
 | `OFFLINE_FALLBACK` | `auto` | `auto` = enable fallback while dry-running; set `1`/`0` to force using or skipping bundled samples |
-| `ANNOUNCEMENT_WINDOW_DAYS` | `7` | 最近多少天的公告会被保留 |
+
 
 ---
 
@@ -86,14 +80,6 @@ Update `.github/workflows/arxiv-cron.yml` to set your keyword矩阵与运行频�
 ## 🧩 Local Testing
 
 ```bash
-# 设置查询条件（每次 dry-run 可替换成任意单个关键词）
-export ARXIV_QUERY="dark matter"
-export ARXIV_CLASSES="hep-th,hep-ex,hep-ph,nucl-ex,physics.ins-det"
-export ANNOUNCEMENT_WINDOW_DAYS="7"
-
-# Dry-run：仅打印结果不推送，可快速确认搜索是否合理。
-# 在无网络或 arxiv.org 屏蔽时，脚本会提示并回退到 sample_data/ 下的样例页面。
-python arxiv_to_feishu.py --dry-run
 
 # 准备好后移除 --dry-run 或设置 WEBHOOK_URL 运行正式推送
 export WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
