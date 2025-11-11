@@ -19,7 +19,7 @@ WEBHOOK_URL   = os.getenv("WEBHOOK_URL")  # 必填：飞书 Incoming Webhook
 # 关键词（放 Secrets 更安全）
 ARXIV_QUERY   = os.getenv(
     "ARXIV_QUERY",
-    "dark matter OR neutrino OR TPC OR xenon OR argon OR WIMP OR CEvNS"
+    "dark matter"
 )
 # 子分类列表（逗号或空格分隔），脚本自动补全为 classification:xxx
 ARXIV_CLASSES = os.getenv(
@@ -34,8 +34,11 @@ RESULT_SIZE = int(os.getenv("RESULT_SIZE", "200"))            # 建议 200，保
 ORDER       = os.getenv("ORDER", "-announced_date_first")     # 按 announced 倒序
 HIDE_ABSTRACTS = os.getenv("HIDE_ABSTRACTS", "False").lower() in ("1","true","yes")  # 需要摘要 → False/0
 
-# 推送条数上限
-TOP_SEND = int(os.getenv("TOP_SEND", "10"))
+# 推送条数上限（0 或负数表示不限制，默认发送全部匹配结果）
+TOP_SEND = int(os.getenv("TOP_SEND", "0"))
+
+# 公告窗口（单位：天），默认最近 7 天
+ANNOUNCEMENT_WINDOW_DAYS = max(1, int(os.getenv("ANNOUNCEMENT_WINDOW_DAYS", "7")))
 
 # 测试模式：仅打印最新公告日条目，不推送到飞书
 DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
@@ -360,15 +363,31 @@ def parse_all_items(html_text: str):
     return parser.items
 
 # ---------- 仅保留“最新公告日”的条目 ----------
-def filter_by_target_date(items, target_date):
-    if target_date is None:
+def filter_by_date_window(items, start_date: Optional[date], end_date: Optional[date]):
+    if start_date is None and end_date is None:
         return items
-    return [it for it in items if it.get("announced_date") == target_date]
+
+    def in_window(item_date: Optional[date]) -> bool:
+        if item_date is None:
+            return False
+        if start_date and item_date < start_date:
+            return False
+        if end_date and item_date > end_date:
+            return False
+        return True
+
+    return [it for it in items if in_window(it.get("announced_date"))]
 
 # ---------- 生成飞书卡片 ----------
-def build_card(items, *, debug_lines: Optional[List[str]] = None):
+def build_card(
+    items,
+    *,
+    debug_lines: Optional[List[str]] = None,
+    intro_text: Optional[str] = None,
+    header_title: str = "arXiv 最近公告（含摘要）",
+):
     if not items:
-        content = "没有符合条件的结果（最新公告日为空或该日无匹配）。"
+        content = "没有符合条件的结果（指定时间范围内无匹配）。"
     else:
         lines = []
         for i, it in enumerate(items, 1):
@@ -404,6 +423,8 @@ def build_card(items, *, debug_lines: Optional[List[str]] = None):
     elements: List[Dict] = []
     if debug_lines:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(debug_lines)}})
+    if intro_text:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": intro_text}})
     elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
 
     return {
@@ -411,7 +432,7 @@ def build_card(items, *, debug_lines: Optional[List[str]] = None):
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "arXiv 最近公告日（含摘要）"},
+                "title": {"tag": "plain_text", "content": header_title[:80]},
                 "template": "blue"
             },
             "elements": elements,
@@ -421,17 +442,18 @@ def build_card(items, *, debug_lines: Optional[List[str]] = None):
 # ---------- 主流程 ----------
 def fetch_latest_announcements(
     *, allow_offline: bool = False
-) -> Tuple[List[Dict], List[Dict], str, date, datetime, str]:
+) -> Tuple[List[Dict], List[Dict], str, Optional[date], datetime, str, Optional[date]]:
     """抓取并返回搜索结果。
 
     Returns:
-        (items, all_items, url, target_date, et_now, full_query)
-        items: 最新公告日的条目
+        (items, all_items, url, target_date, et_now, full_query, window_start)
+        items: 最近 N 天（含 target_date）内的条目
         all_items: 搜索结果全部条目
         url: 使用的搜索地址
         target_date: 目标公告日
         et_now: 从 /localtime 推断的当前 ET 时间
         full_query: 实际发送到搜索接口的查询字符串
+        window_start: 公告窗口起始日
     """
     # A) 读取 /localtime → 推断“最新公告日”（ET）
     et_now = _get_et_now_from_localtime(allow_offline=allow_offline)
@@ -451,8 +473,11 @@ def fetch_latest_announcements(
 
     # C) 解析整页 → 仅保留“最新公告日”
     all_items = parse_all_items(resp_text)
-    items = filter_by_target_date(all_items, target_date)
-    return items, all_items, url, target_date, et_now, full_query
+    window_start = None
+    if target_date is not None:
+        window_start = target_date - timedelta(days=ANNOUNCEMENT_WINDOW_DAYS - 1)
+    items = filter_by_date_window(all_items, window_start, target_date)
+    return items, all_items, url, target_date, et_now, full_query, window_start
 
 
 def summarize_items(items: List[Dict]) -> str:
@@ -516,15 +541,24 @@ def main():
         print("Offline fallback enabled: 网络失败时将使用样例页面。", flush=True)
 
     try:
-        items, all_items, url, target_date, et_now, full_query = fetch_latest_announcements(
-            allow_offline=allow_offline
-        )
+        (
+            items,
+            all_items,
+            url,
+            target_date,
+            et_now,
+            full_query,
+            window_start,
+        ) = fetch_latest_announcements(allow_offline=allow_offline)
     except RuntimeError as exc:
         print(f"拉取数据失败：{exc}", flush=True)
         raise SystemExit(1)
 
     top_limit = args.top if args.top is not None else TOP_SEND
-    to_process = items[:top_limit]
+    if top_limit and top_limit > 0:
+        to_process = items[:top_limit]
+    else:
+        to_process = items
 
     if debug:
         print(f"[debug] Using query: {full_query}")
@@ -537,10 +571,23 @@ def main():
                 phys=REQUIRE_PHYSICS_GROUP,
             )
         )
+        print(
+            "[debug] Announcement window => days: {days}, start: {start}, end: {end}".format(
+                days=ANNOUNCEMENT_WINDOW_DAYS,
+                start=window_start,
+                end=target_date,
+            )
+        )
 
     print(f"Localtime ET now: {et_now} -> latest announcement date: {target_date}")
+    if window_start:
+        print(f"Collecting announcements from {window_start} to {target_date} (最近 {ANNOUNCEMENT_WINDOW_DAYS} 天)")
     print(f"URL used: {url}")
-    print(f"Parsed {len(all_items)} items; kept {len(items)} on {target_date}; using top {len(to_process)}.")
+    print(
+        "Parsed {total} items; kept {kept} within window; using top {top}.".format(
+            total=len(all_items), kept=len(items), top=len(to_process)
+        )
+    )
     print("Summary:\n" + summarize_items(to_process))
 
     if dry_run:
@@ -554,9 +601,20 @@ def main():
             f"Query: `{full_query}`",
             f"Size: `{RESULT_SIZE}`  |  Order: `{ORDER}`  |  Hide abstracts: `{HIDE_ABSTRACTS}`",
             f"Require physics group: `{REQUIRE_PHYSICS_GROUP}`",
+            f"Window days: `{ANNOUNCEMENT_WINDOW_DAYS}`  |  Start: `{window_start}`  |  End: `{target_date}`",
         ]
 
-    payload = build_card(to_process, debug_lines=debug_lines)
+    intro_text = None
+    if window_start and target_date:
+        intro_text = f"最近 `{ANNOUNCEMENT_WINDOW_DAYS}` 天（{window_start} → {target_date}）的公告汇总。"
+    header_title = f"arXiv 公告（最近 {ANNOUNCEMENT_WINDOW_DAYS} 天）"
+
+    payload = build_card(
+        to_process,
+        debug_lines=debug_lines,
+        intro_text=intro_text,
+        header_title=header_title,
+    )
     response_text = _http_post_json(WEBHOOK_URL, payload, timeout=30)
 
     print("Feishu response:", response_text)
