@@ -54,17 +54,6 @@ SAMPLE_DIR = os.path.join(BASE_DIR, "sample_data")
 SAMPLE_SEARCH_FILE = os.path.join(SAMPLE_DIR, "sample_search.html")
 SAMPLE_LOCALTIME_FILE = os.path.join(SAMPLE_DIR, "sample_localtime.html")
 
-# 测试模式：仅打印最新公告日条目，不推送到飞书
-DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
-
-# 离线兜底：当网络访问受限时是否允许回退到本地样例数据（auto=随 Dry-run 而定）
-_OFFLINE_ENV = os.getenv("OFFLINE_FALLBACK", "auto").lower()
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SAMPLE_DIR = os.path.join(BASE_DIR, "sample_data")
-SAMPLE_SEARCH_FILE = os.path.join(SAMPLE_DIR, "sample_search.html")
-SAMPLE_LOCALTIME_FILE = os.path.join(SAMPLE_DIR, "sample_localtime.html")
-
 SEARCH_BASE = "https://arxiv.org/search/"
 ARXIV_LOCALTIME = "https://arxiv.org/localtime"
 
@@ -254,6 +243,8 @@ class _ArxivResultParser(HTMLParser):
         elif tag in ("span", "p") and any(cls.startswith("abstract") for cls in class_list):
             push_buffer("abstract")
         elif tag == "span" and "tag" in class_list:
+            if self._current["buffers"].get("cat"):
+                self._current["buffers"]["cat"].append(" ")
             push_buffer("cat")
         elif tag == "p" and "is-size-7" in class_list:
             name = f"meta_{len(self._current['meta_names'])}"
@@ -323,6 +314,8 @@ class _ArxivResultParser(HTMLParser):
             return _normalize_ws(text)
 
         title = get_text("title")
+        if title.lower().startswith("title:"):
+            title = title[len("title:"):].strip()
         authors = get_text("authors")
         if authors.lower().startswith("authors:"):
             authors = authors[len("authors:"):].strip()
@@ -389,6 +382,20 @@ def filter_by_date_window(items, start_date: Optional[date], end_date: Optional[
 
     return [it for it in items if in_window(it.get("announced_date"))]
 
+
+def summarize_items(items: List[Dict]) -> str:
+    if not items:
+        return "(no items)"
+
+    lines = []
+    for idx, item in enumerate(items, 1):
+        title = item.get("title") or "(no title)"
+        date_obj = item.get("announced_date")
+        date_str = date_obj.isoformat() if isinstance(date_obj, date) else "?"
+        category = item.get("cat") or ""
+        lines.append(f"{idx}. {title} [{date_str}] {category}")
+    return "\n".join(lines)
+
 # ---------- 生成飞书卡片 ----------
 def build_card(
     items,
@@ -451,18 +458,33 @@ def build_card(
     }
 
 # ---------- 主流程 ----------
+def _resolve_offline_flag(cli_flag: Optional[bool]) -> bool:
+    if cli_flag is not None:
+        return cli_flag
+
+    if _OFFLINE_ENV in ("1", "true", "yes", "on"):
+        return True
+    if _OFFLINE_ENV in ("0", "false", "no", "off"):
+        return False
+
+    # auto → 跟随 Dry-run
+    return DRY_RUN
+
+
 def fetch_latest_announcements(
-    *, allow_offline: bool = False
-        all_items: 搜索结果全部条目
-        url: 使用的搜索地址
-        target_date: 目标公告日
-        et_now: 从 /localtime 推断的当前 ET 时间
-    """
-    # A) 读取 /localtime → 推断“最新公告日”（ET）
+    *,
+    allow_offline: bool = False,
+    window_days: Optional[int] = None,
+    top_limit: Optional[int] = None,
+):
+    """Fetch and parse arXiv search results, returning metadata for later processing."""
+
+    window_days = window_days if window_days and window_days > 0 else ANNOUNCEMENT_WINDOW_DAYS
+    top_limit = top_limit if top_limit and top_limit > 0 else TOP_SEND if TOP_SEND > 0 else None
+
     et_now = _get_et_now_from_localtime(allow_offline=allow_offline)
     target_date = _most_recent_announcement_date(et_now)
 
-    # B) 构造 classification 查询 + 抓取搜索页（含摘要）
     full_query = build_web_query(ARXIV_QUERY, ARXIV_CLASSES, REQUIRE_PHYSICS_GROUP)
     url = build_search_url(full_query, RESULT_SIZE, ORDER, HIDE_ABSTRACTS)
     headers = {"User-Agent": "Mozilla/5.0 (arxiv-feishu-bot; classification-search)"}
@@ -474,18 +496,78 @@ def fetch_latest_announcements(
         allow_offline=allow_offline,
     )
 
-    # C) 解析整页 → 仅保留“最新公告日”
     all_items = parse_all_items(resp_text)
 
-    print("Summary:\n" + summarize_items(to_process))
+    window_start = target_date - timedelta(days=window_days - 1) if window_days > 1 else target_date
+    window_end = target_date
+    filtered_items = filter_by_date_window(all_items, window_start, window_end)
+    if top_limit:
+        filtered_items = filtered_items[:top_limit]
 
+    return {
+        "all_items": all_items,
+        "filtered_items": filtered_items,
+        "target_date": target_date,
+        "window_start": window_start,
+        "window_end": window_end,
+        "et_now": et_now,
+        "query": full_query,
+        "url": url,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fetch latest arXiv announcements and post to Feishu.")
+    parser.add_argument("--offline", dest="allow_offline", action="store_true", help="允许在网络失败时使用本地样例数据")
+    parser.add_argument("--no-offline", dest="allow_offline", action="store_false", help="禁用离线兜底")
+    parser.add_argument("--window-days", type=int, default=None, help="公告窗口天数（覆盖环境变量）")
+    parser.add_argument("--top", type=int, default=None, help="推送前保留的条目数量（覆盖 TOP_SEND）")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="仅打印结果，不推送飞书")
+    parser.add_argument("--send", dest="dry_run", action="store_false", help="强制推送至飞书")
+    parser.add_argument("--intro", default=None, help="卡片开头补充说明")
+    parser.set_defaults(allow_offline=None, dry_run=DRY_RUN)
+    args = parser.parse_args()
+
+    allow_offline = _resolve_offline_flag(args.allow_offline)
+    result = fetch_latest_announcements(
+        allow_offline=allow_offline,
+        window_days=args.window_days,
+        top_limit=args.top,
+    )
+
+    items = result["filtered_items"]
+    summary = summarize_items(items)
+    print("Summary:\n" + summary)
+
+    debug_lines = None
+    if DEBUG_MODE:
+        debug_lines = [
+            f"Query: `{result['query']}`",
+            f"URL: {result['url']}",
+            f"ET now: {result['et_now'].isoformat(sep=' ')}",
+            f"Window: {result['window_start']} → {result['window_end']}",
+            f"Fetched: {len(result['all_items'])} | Selected: {len(items)}",
+        ]
+
+    header_title = f"arXiv 公告 {result['window_start']} - {result['window_end']}"
+    payload = build_card(
+        items,
+        debug_lines=debug_lines,
+        intro_text=args.intro,
+        header_title=header_title,
+    )
+
+    dry_run = args.dry_run
     if dry_run:
         print("Dry-run mode: 不推送飞书。")
         return
 
-    response_text = _http_post_json(WEBHOOK_URL, payload, timeout=30)
+    if not WEBHOOK_URL:
+        raise RuntimeError("WEBHOOK_URL 未配置，无法推送到飞书。")
 
+    response_text = _http_post_json(WEBHOOK_URL, payload, timeout=30)
     print("Feishu response:", response_text)
+
 
 if __name__ == "__main__":
     main()
