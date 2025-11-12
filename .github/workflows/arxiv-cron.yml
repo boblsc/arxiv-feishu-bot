@@ -1,14 +1,26 @@
-name: Daily arXiv push to Feishu (classification)
+name: Weekly arXiv push to Feishu (classification)
 
 on:
   schedule:
-    # 每天 16:00 UTC 触发（≈ 洛杉矶早上 09:00，夏令时期间）
-    - cron: '0 1 * * *'
+    # 每周一 01:00 UTC 触发（≈ 北京时间 09:00，洛杉矶前一天下午）
+    - cron: '0 1 * * 1'
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        keyword: ${{ fromJson(vars.ARXIV_KEYWORDS_JSON || '["dark matter","neutrino","TPC","xenon","argon","WIMP","CEvNS"]') }}
+    env:
+      ARXIV_CLASSES: ${{ secrets.ARXIV_CLASSES }}
+      REQUIRE_PHYSICS_GROUP: "1"
+      RESULT_SIZE: "200"
+      ORDER: "-announced_date_first"
+      HIDE_ABSTRACTS: "False"
+      TOP_SEND: "0"
+      ANNOUNCEMENT_WINDOW_DAYS: "7"
 
     steps:
       - name: Checkout
@@ -19,27 +31,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4
-
       - name: Push to Feishu
         env:
-          WEBHOOK_URL:        ${{ secrets.FEISHU_WEBHOOK_URL }}
-          ARXIV_QUERY:        ${{ secrets.ARXIV_QUERY }}          # 你的关键词集合
-          ARXIV_CLASSES:      ${{ secrets.ARXIV_CLASSES }}        # 例如：hep-th,hep-ex,hep-ph,nucl-ex,physics.ins-det
-        
-          REQUIRE_PHYSICS_GROUP: "1"
-          RESULT_SIZE: "50"
-          ORDER: "-announced_date_first"
-        
-          # 关键：要摘要 + 只当天
-          HIDE_ABSTRACTS: "False"
-          TODAY_ONLY: "1"
-          LOCAL_TZ: "America/Los_Angeles"
-        
-          TOP_SEND: "10"
-          DAYS: "0"   # TODAY_ONLY 已经满足当天，这里保持 0
+          WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          ARXIV_QUERY: ${{ matrix.keyword }}
         run: |
           python arxiv_to_feishu.py

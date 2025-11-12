@@ -19,7 +19,7 @@ WEBHOOK_URL   = os.getenv("WEBHOOK_URL")  # 必填：飞书 Incoming Webhook
 # 关键词（放 Secrets 更安全）
 ARXIV_QUERY   = os.getenv(
     "ARXIV_QUERY",
-    "dark matter OR neutrino OR TPC OR xenon OR argon OR WIMP OR CEvNS"
+    "dark matter"
 )
 # 子分类列表（逗号或空格分隔），脚本自动补全为 classification:xxx
 ARXIV_CLASSES = os.getenv(
@@ -34,8 +34,25 @@ RESULT_SIZE = int(os.getenv("RESULT_SIZE", "200"))            # 建议 200，保
 ORDER       = os.getenv("ORDER", "-announced_date_first")     # 按 announced 倒序
 HIDE_ABSTRACTS = os.getenv("HIDE_ABSTRACTS", "False").lower() in ("1","true","yes")  # 需要摘要 → False/0
 
-# 推送条数上限
-TOP_SEND = int(os.getenv("TOP_SEND", "10"))
+# 推送条数上限（0 或负数表示不限制，默认发送全部匹配结果）
+TOP_SEND = int(os.getenv("TOP_SEND", "0"))
+
+# 公告窗口（单位：天），默认最近 7 天
+ANNOUNCEMENT_WINDOW_DAYS = max(1, int(os.getenv("ANNOUNCEMENT_WINDOW_DAYS", "7")))
+
+# 测试模式：仅打印最新公告日条目，不推送到飞书
+DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
+
+# Debug 模式：输出更多诊断信息，并将查询参数传递到飞书卡片
+DEBUG_MODE = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
+
+# 离线兜底：当网络访问受限时是否允许回退到本地样例数据（auto=随 Dry-run 而定）
+_OFFLINE_ENV = os.getenv("OFFLINE_FALLBACK", "auto").lower()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_DIR = os.path.join(BASE_DIR, "sample_data")
+SAMPLE_SEARCH_FILE = os.path.join(SAMPLE_DIR, "sample_search.html")
+SAMPLE_LOCALTIME_FILE = os.path.join(SAMPLE_DIR, "sample_localtime.html")
 
 # 测试模式：仅打印最新公告日条目，不推送到飞书
 DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
@@ -357,15 +374,31 @@ def parse_all_items(html_text: str):
     return parser.items
 
 # ---------- 仅保留“最新公告日”的条目 ----------
-def filter_by_target_date(items, target_date):
-    if target_date is None:
+def filter_by_date_window(items, start_date: Optional[date], end_date: Optional[date]):
+    if start_date is None and end_date is None:
         return items
-    return [it for it in items if it.get("announced_date") == target_date]
+
+    def in_window(item_date: Optional[date]) -> bool:
+        if item_date is None:
+            return False
+        if start_date and item_date < start_date:
+            return False
+        if end_date and item_date > end_date:
+            return False
+        return True
+
+    return [it for it in items if in_window(it.get("announced_date"))]
 
 # ---------- 生成飞书卡片 ----------
-def build_card(items):
+def build_card(
+    items,
+    *,
+    debug_lines: Optional[List[str]] = None,
+    intro_text: Optional[str] = None,
+    header_title: str = "arXiv 最近公告（含摘要）",
+):
     if not items:
-        content = "没有符合条件的结果（最新公告日为空或该日无匹配）。"
+        content = "没有符合条件的结果（指定时间范围内无匹配）。"
     else:
         lines = []
         for i, it in enumerate(items, 1):
@@ -398,29 +431,28 @@ def build_card(items):
             lines += [head, meta, abstract if abstract else "_(no abstract on list page)_", links, ""]
         content = "\n\n".join(lines)
 
+    elements: List[Dict] = []
+    if debug_lines:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(debug_lines)}})
+    if intro_text:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": intro_text}})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
+
     return {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "arXiv 最近公告日（含摘要）"},
+                "title": {"tag": "plain_text", "content": header_title[:80]},
                 "template": "blue"
             },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": content}}
-            ],
+            "elements": elements,
         }
     }
 
 # ---------- 主流程 ----------
 def fetch_latest_announcements(
     *, allow_offline: bool = False
-) -> Tuple[List[Dict], List[Dict], str, date, datetime]:
-    """抓取并返回搜索结果。
-
-    Returns:
-        (items, all_items, url, target_date, et_now)
-        items: 最新公告日的条目
         all_items: 搜索结果全部条目
         url: 使用的搜索地址
         target_date: 目标公告日
@@ -444,89 +476,13 @@ def fetch_latest_announcements(
 
     # C) 解析整页 → 仅保留“最新公告日”
     all_items = parse_all_items(resp_text)
-    items = filter_by_target_date(all_items, target_date)
-    return items, all_items, url, target_date, et_now
 
-
-def summarize_items(items: List[Dict]) -> str:
-    """生成用于 CLI 打印的概要文本。"""
-    if not items:
-        return "没有符合条件的结果。"
-    lines = []
-    for i, it in enumerate(items, 1):
-        title = it.get("title", "")
-        authors = it.get("authors", "")
-        date_str = it.get("announced_date")
-        date_str = date_str.isoformat() if date_str else "未知日期"
-        cat = it.get("cat", "")
-        lines.append(f"{i}. {title} | {authors} | {date_str} | {cat}")
-    return "\n".join(lines)
-
-
-def _cli_args():
-    parser = argparse.ArgumentParser(description="Fetch arXiv announcements and optionally push to Feishu.")
-    parser.add_argument("--dry-run", action="store_true", help="只打印结果，不推送飞书")
-    parser.add_argument("--top", type=int, default=None, help="限制输出/推送的条数")
-    parser.add_argument(
-        "--offline-fallback",
-        dest="offline_fallback",
-        action="store_true",
-        help="网络受限时使用本地样例数据（默认：Dry-run 时启用）",
-    )
-    parser.add_argument(
-        "--no-offline-fallback",
-        dest="offline_fallback",
-        action="store_false",
-        help="禁用离线样例兜底",
-    )
-    parser.set_defaults(offline_fallback=None)
-    return parser.parse_args()
-
-
-def _resolve_offline_flag(cli_flag: Optional[bool], dry_run: bool) -> bool:
-    if cli_flag is not None:
-        return cli_flag
-    if _OFFLINE_ENV in {"1", "true", "yes", "on"}:
-        return True
-    if _OFFLINE_ENV in {"0", "false", "no", "off"}:
-        return False
-    return dry_run
-
-
-def main():
-    args = _cli_args()
-    dry_run = DRY_RUN or args.dry_run
-    allow_offline = _resolve_offline_flag(args.offline_fallback, dry_run)
-
-    if not WEBHOOK_URL:
-        if not dry_run:
-            print("缺少 WEBHOOK_URL（飞书 Incoming Webhook）。", flush=True)
-            raise SystemExit(2)
-
-    if allow_offline:
-        print("Offline fallback enabled: 网络失败时将使用样例页面。", flush=True)
-
-    try:
-        items, all_items, url, target_date, et_now = fetch_latest_announcements(
-            allow_offline=allow_offline
-        )
-    except RuntimeError as exc:
-        print(f"拉取数据失败：{exc}", flush=True)
-        raise SystemExit(1)
-
-    top_limit = args.top if args.top is not None else TOP_SEND
-    to_process = items[:top_limit]
-
-    print(f"Localtime ET now: {et_now} -> latest announcement date: {target_date}")
-    print(f"URL used: {url}")
-    print(f"Parsed {len(all_items)} items; kept {len(items)} on {target_date}; using top {len(to_process)}.")
     print("Summary:\n" + summarize_items(to_process))
 
     if dry_run:
         print("Dry-run mode: 不推送飞书。")
         return
 
-    payload = build_card(to_process)
     response_text = _http_post_json(WEBHOOK_URL, payload, timeout=30)
 
     print("Feishu response:", response_text)
