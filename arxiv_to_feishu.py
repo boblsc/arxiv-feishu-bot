@@ -1,14 +1,17 @@
 # arxiv_to_feishu.py
 # 模式：网页搜索（classification）+ 以 https://arxiv.org/localtime 推断“最新公告日” + 含摘要
-# 依赖：pip install requests beautifulsoup4
+# 依赖：仅标准库（无需额外安装）
 
+import argparse
+import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
+from typing import Dict, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
-
-import requests
-from bs4 import BeautifulSoup
+from urllib.request import Request, urlopen
 
 # ===== 环境变量（值不要加引号）=====
 WEBHOOK_URL   = os.getenv("WEBHOOK_URL")  # 必填：飞书 Incoming Webhook
@@ -16,7 +19,7 @@ WEBHOOK_URL   = os.getenv("WEBHOOK_URL")  # 必填：飞书 Incoming Webhook
 # 关键词（放 Secrets 更安全）
 ARXIV_QUERY   = os.getenv(
     "ARXIV_QUERY",
-    "dark matter OR neutrino OR TPC OR xenon OR argon OR WIMP OR CEvNS"
+    "dark matter"
 )
 # 子分类列表（逗号或空格分隔），脚本自动补全为 classification:xxx
 ARXIV_CLASSES = os.getenv(
@@ -31,11 +34,87 @@ RESULT_SIZE = int(os.getenv("RESULT_SIZE", "200"))            # 建议 200，保
 ORDER       = os.getenv("ORDER", "-announced_date_first")     # 按 announced 倒序
 HIDE_ABSTRACTS = os.getenv("HIDE_ABSTRACTS", "False").lower() in ("1","true","yes")  # 需要摘要 → False/0
 
-# 推送条数上限
-TOP_SEND = int(os.getenv("TOP_SEND", "10"))
+# 推送条数上限（0 或负数表示不限制，默认发送全部匹配结果）
+TOP_SEND = int(os.getenv("TOP_SEND", "0"))
+
+# 公告窗口（单位：天），默认最近 7 天
+ANNOUNCEMENT_WINDOW_DAYS = max(1, int(os.getenv("ANNOUNCEMENT_WINDOW_DAYS", "7")))
+
+# 测试模式：仅打印最新公告日条目，不推送到飞书
+DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
+
+# Debug 模式：输出更多诊断信息，并将查询参数传递到飞书卡片
+DEBUG_MODE = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
+
+# 离线兜底：当网络访问受限时是否允许回退到本地样例数据（auto=随 Dry-run 而定）
+_OFFLINE_ENV = os.getenv("OFFLINE_FALLBACK", "auto").lower()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SAMPLE_DIR = os.path.join(BASE_DIR, "sample_data")
+SAMPLE_SEARCH_FILE = os.path.join(SAMPLE_DIR, "sample_search.html")
+SAMPLE_LOCALTIME_FILE = os.path.join(SAMPLE_DIR, "sample_localtime.html")
 
 SEARCH_BASE = "https://arxiv.org/search/"
 ARXIV_LOCALTIME = "https://arxiv.org/localtime"
+
+
+def _load_sample_text(path: str) -> Optional[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def _http_get_text(
+    url: str,
+    *,
+    headers=None,
+    timeout: int = 30,
+    fallback_text: Optional[str] = None,
+    fallback_path: Optional[str] = None,
+    allow_offline: bool = False,
+) -> str:
+    headers = headers or {}
+    req = Request(url, headers=headers)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, errors="replace")
+    except HTTPError as exc:
+        err = RuntimeError(f"HTTP {exc.code} when requesting {url}")
+        orig_exc = exc
+    except URLError as exc:
+        err = RuntimeError(f"Failed to request {url}: {exc.reason}")
+        orig_exc = exc
+
+    if allow_offline:
+        offline_text = fallback_text
+        if offline_text is None and fallback_path:
+            offline_text = _load_sample_text(fallback_path)
+        if offline_text is not None:
+            source = fallback_path if fallback_path else "inline sample"
+            print(f"[offline fallback] {err}. Using {source}.", flush=True)
+            return offline_text
+
+    raise err from orig_exc
+
+
+def _http_post_json(url: str, payload: Dict, *, headers=None, timeout: int = 30) -> str:
+    data = json.dumps(payload).encode("utf-8")
+    req_headers = {"Content-Type": "application/json; charset=utf-8"}
+    if headers:
+        req_headers.update(headers)
+    req = Request(url, data=data, headers=req_headers, method="POST")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, errors="replace")
+    except HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} when posting to {url}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Failed to post to {url}: {exc.reason}") from exc
+
 
 # ---------- 查询构造 ----------
 def _normalize_class_tokens(raw: str):
@@ -76,14 +155,18 @@ _MONTH_MAP = {
     "Jul":7, "Aug":8, "Sep":9, "Oct":10, "Nov":11, "Dec":12
 }
 
-def _get_et_now_from_localtime() -> datetime:
+def _get_et_now_from_localtime(*, allow_offline: bool = False) -> datetime:
     """
     从 https://arxiv.org/localtime 抓取 'Tue, 28 Oct 2025 22:40 EDT' 这行，解析成 ET 的 datetime（无 tz，仅用于日期/小时判断）。
     """
     headers = {"User-Agent": "Mozilla/5.0 (arxiv-feishu-bot; localtime-check)"}
-    r = requests.get(ARXIV_LOCALTIME, headers=headers, timeout=20)
-    r.raise_for_status()
-    html = r.text
+    html = _http_get_text(
+        ARXIV_LOCALTIME,
+        headers=headers,
+        timeout=20,
+        fallback_path=SAMPLE_LOCALTIME_FILE,
+        allow_offline=allow_offline,
+    )
     m = _ET_LINE_RE.search(html)
     if not m:
         # 兜底：若解析失败，就用当前 UTC 日期（近似），但强烈建议确保正则匹配
@@ -121,48 +204,202 @@ def _most_recent_announcement_date(et_now: datetime):
 # ---------- 解析搜索结果 ----------
 _DATE_RE = re.compile(r"(announced|Submitted)\s+on\s+([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})")
 
-def _extract_announced_date(li: BeautifulSoup):
-    for p in li.select("p.is-size-7"):
-        t = p.get_text(" ", strip=True)
-        if "announced" in t or "Submitted" in t:
-            m = _DATE_RE.search(t)
-            if m:
-                try:
-                    return datetime.strptime(m.group(2), "%B %d, %Y").date()
-                except Exception:
-                    return None
+_DATE_CANDIDATE_RE = re.compile(
+    r"("  # month-first formats
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\.?\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s*\d{4}"
+    r")"
+    r"|"  # or day-first formats
+    r"("  # capture group 2
+    r"\d{1,2}(?:st|nd|rd|th)?\s+"
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\.?\s*(?:,)?\s*\d{4}"
+    r")",
+    re.I,
+)
+
+_DATE_FORMATS = (
+    "%B %d, %Y",
+    "%b %d, %Y",
+    "%B %d %Y",
+    "%b %d %Y",
+    "%d %B %Y",
+    "%d %b %Y",
+    "%d %b, %Y",
+    "%d %B, %Y",
+)
+
+
+def _parse_announcement_date(text: str) -> Optional[date]:
+    """解析 meta 文本中的公告日期。
+
+    arXiv 搜索页存在多种日期格式：
+    - "Submitted on October 31, 2023"
+    - "Submitted 10 Nov 2023"
+    - "Originally announced November 2, 2023"
+
+    原先的正则仅匹配第一种格式，若无法解析日期就会导致整条记录被过滤，
+    因而这里尝试捕获常见的 month-first 与 day-first 组合。
+    """
+
+    text = _normalize_ws(text)
+
+    # 先尝试历史格式："Submitted on October 31, 2023"
+    legacy = _DATE_RE.search(text)
+    if legacy:
+        try:
+            return datetime.strptime(legacy.group(2), "%B %d, %Y").date()
+        except ValueError:
+            pass
+
+    # 新格式：直接在文本中查找包含月份名称的日期字符串
+    for match in _DATE_CANDIDATE_RE.finditer(text):
+        cand = match.group(0)
+        cand = cand.replace("Sept", "Sep")  # %b/%B 不识别 "Sept"
+        cand = cand.replace("sept", "Sep")
+        # 去除英文序数后缀
+        cand = re.sub(r"(\d{1,2})(st|nd|rd|th)", r"\1", cand, flags=re.I)
+        cand = re.sub(r"\.(?=\s)", "", cand)  # 移除月份后的句点
+        cand = re.sub(r"\s+", " ", cand.strip())
+
+        for fmt in _DATE_FORMATS:
+            try:
+                return datetime.strptime(cand, fmt).date()
+            except ValueError:
+                continue
+
     return None
 
-def _extract_abstract(li: BeautifulSoup) -> str:
-    node = (li.select_one("span.abstract-full")
-            or li.select_one("p.abstract")
-            or li.select_one("span.abstract-short"))
-    if not node:
-        return ""
-    txt = node.get_text(" ", strip=True)
-    txt = re.sub(r"^\s*Abstract:\s*", "", txt, flags=re.I)
-    txt = re.sub(r"\s*(Show less|△ Less|▽ More)\s*$", "", txt, flags=re.I)
-    return txt.strip()
 
-def parse_all_items(html_text: str):
-    soup = BeautifulSoup(html_text, "html.parser")
-    items = []
-    for li in soup.select("li.arxiv-result"):
-        d = _extract_announced_date(li)
+def _normalize_ws(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
-        title_tag = li.select_one("p.title")
-        title = title_tag.get_text(strip=True) if title_tag else ""
 
-        auth_tag = li.select_one("p.authors")
-        authors = re.sub(r"\s+", " ", auth_tag.get_text(strip=True).replace("Authors:", "").strip()) if auth_tag else ""
+class _ArxivResultParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.items: List[Dict] = []
+        self._in_item = False
+        self._depth = 0
+        self._current = None
+        self._target_stack = []
 
-        abs_link, pdf_link = None, None
-        for a in li.select("a"):
-            href = a.get("href", "")
-            if "/abs/" in href and not abs_link:
-                abs_link = href
-            if "/pdf/" in href and href.endswith(".pdf"):
-                pdf_link = href
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        classes = attrs_dict.get("class", "")
+        class_list = classes.split()
+
+        if tag == "li" and not self._in_item and "arxiv-result" in class_list:
+            self._start_item()
+            return
+
+        if not self._in_item:
+            return
+
+        self._depth += 1
+
+        def push_buffer(name: str):
+            self._current["buffers"].setdefault(name, [])
+            self._target_stack.append((tag, name))
+
+        if tag == "p" and "title" in class_list:
+            push_buffer("title")
+        elif tag == "p" and "authors" in class_list:
+            push_buffer("authors")
+        elif tag in ("span", "p") and any(cls.startswith("abstract") for cls in class_list):
+            push_buffer("abstract")
+        elif tag == "span" and "tag" in class_list:
+            push_buffer("cat")
+        elif tag == "p" and "is-size-7" in class_list:
+            name = f"meta_{len(self._current['meta_names'])}"
+            self._current["meta_names"].append(name)
+            push_buffer(name)
+
+        if tag == "a":
+            href = attrs_dict.get("href", "")
+            if href:
+                if "/abs/" in href and not self._current.get("abs_link"):
+                    self._current["abs_link"] = href
+                if "/pdf/" in href and href.endswith(".pdf"):
+                    self._current["pdf_link"] = href
+
+    def handle_startendtag(self, tag, attrs):
+        # Treat self-closing tags as start+end to keep depth balanced.
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if not self._in_item:
+            return
+
+        if tag == "li":
+            self._depth -= 1
+            if self._depth <= 0:
+                item = self._finalize_item()
+                if item:
+                    self.items.append(item)
+                self._in_item = False
+                self._current = None
+                self._target_stack = []
+            return
+
+        idx = len(self._target_stack) - 1
+        while idx >= 0:
+            entry_tag, _ = self._target_stack[idx]
+            if entry_tag == tag:
+                self._target_stack.pop(idx)
+                break
+            idx -= 1
+
+        self._depth -= 1
+
+    def handle_data(self, data):
+        if not self._in_item or not data:
+            return
+        for _, name in self._target_stack:
+            self._current["buffers"].setdefault(name, []).append(data)
+
+    def _start_item(self):
+        self._in_item = True
+        self._depth = 1
+        self._current = {
+            "buffers": {},
+            "meta_names": [],
+            "abs_link": None,
+            "pdf_link": None,
+        }
+        self._target_stack = []
+
+    def _finalize_item(self):
+        buffers = self._current["buffers"]
+
+        def get_text(name: str) -> str:
+            text = "".join(buffers.get(name, []))
+            return _normalize_ws(text)
+
+        title = get_text("title")
+        authors = get_text("authors")
+        if authors.lower().startswith("authors:"):
+            authors = authors[len("authors:"):].strip()
+        authors = _normalize_ws(authors)
+        abstract = get_text("abstract")
+        if abstract:
+            abstract = re.sub(r"^Abstract:\s*", "", abstract, flags=re.I)
+            abstract = re.sub(r"\s*(Show less|△ Less|▽ More)\s*$", "", abstract, flags=re.I)
+        category = get_text("cat")
+        category = _normalize_ws(category)
+
+        announced_date = None
+        for meta_name in self._current["meta_names"]:
+            meta_text = get_text(meta_name)
+            if not meta_text:
+                continue
+            announced_date = _parse_announcement_date(meta_text)
+            if announced_date:
+                break
+
+        abs_link = self._current.get("abs_link") or ""
+        pdf_link = self._current.get("pdf_link") or ""
         if abs_link and not abs_link.startswith("http"):
             abs_link = "https://arxiv.org" + abs_link
         if pdf_link and not pdf_link.startswith("http"):
@@ -170,30 +407,49 @@ def parse_all_items(html_text: str):
         if not pdf_link and abs_link and "/abs/" in abs_link:
             pdf_link = abs_link.replace("/abs/", "/pdf/") + ".pdf"
 
-        cat = li.select_one("span.tag").get_text(strip=True) if li.select_one("span.tag") else ""
-        abstract = _extract_abstract(li)
-
-        items.append({
+        return {
             "title": title,
             "authors": authors,
-            "abs": abs_link or "",
-            "pdf": pdf_link or "",
-            "cat": cat,
-            "announced_date": d,   # date() 或 None
+            "abs": abs_link,
+            "pdf": pdf_link,
+            "cat": category,
+            "announced_date": announced_date,
             "abstract": abstract,
-        })
-    return items
+        }
+
+
+def parse_all_items(html_text: str):
+    parser = _ArxivResultParser()
+    parser.feed(html_text)
+    parser.close()
+    return parser.items
 
 # ---------- 仅保留“最新公告日”的条目 ----------
-def filter_by_target_date(items, target_date):
-    if target_date is None:
+def filter_by_date_window(items, start_date: Optional[date], end_date: Optional[date]):
+    if start_date is None and end_date is None:
         return items
-    return [it for it in items if it.get("announced_date") == target_date]
+
+    def in_window(item_date: Optional[date]) -> bool:
+        if item_date is None:
+            return False
+        if start_date and item_date < start_date:
+            return False
+        if end_date and item_date > end_date:
+            return False
+        return True
+
+    return [it for it in items if in_window(it.get("announced_date"))]
 
 # ---------- 生成飞书卡片 ----------
-def build_card(items):
+def build_card(
+    items,
+    *,
+    debug_lines: Optional[List[str]] = None,
+    intro_text: Optional[str] = None,
+    header_title: str = "arXiv 最近公告（含摘要）",
+):
     if not items:
-        content = "没有符合条件的结果（最新公告日为空或该日无匹配）。"
+        content = "没有符合条件的结果（指定时间范围内无匹配）。"
     else:
         lines = []
         for i, it in enumerate(items, 1):
@@ -226,51 +482,204 @@ def build_card(items):
             lines += [head, meta, abstract if abstract else "_(no abstract on list page)_", links, ""]
         content = "\n\n".join(lines)
 
+    elements: List[Dict] = []
+    if debug_lines:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(debug_lines)}})
+    if intro_text:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": intro_text}})
+    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": content}})
+
     return {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "arXiv 最近公告日（含摘要）"},
+                "title": {"tag": "plain_text", "content": header_title[:80]},
                 "template": "blue"
             },
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": content}}
-            ],
+            "elements": elements,
         }
     }
 
 # ---------- 主流程 ----------
-def main():
-    if not WEBHOOK_URL:
-        print("缺少 WEBHOOK_URL（飞书 Incoming Webhook）。", flush=True)
-        raise SystemExit(2)
+def fetch_latest_announcements(
+    *, allow_offline: bool = False
+) -> Tuple[List[Dict], List[Dict], str, Optional[date], datetime, str, Optional[date]]:
+    """抓取并返回搜索结果。
 
+    Returns:
+        (items, all_items, url, target_date, et_now, full_query, window_start)
+        items: 最近 N 天（含 target_date）内的条目
+        all_items: 搜索结果全部条目
+        url: 使用的搜索地址
+        target_date: 目标公告日
+        et_now: 从 /localtime 推断的当前 ET 时间
+        full_query: 实际发送到搜索接口的查询字符串
+        window_start: 公告窗口起始日
+    """
     # A) 读取 /localtime → 推断“最新公告日”（ET）
-    et_now = _get_et_now_from_localtime()
+    et_now = _get_et_now_from_localtime(allow_offline=allow_offline)
     target_date = _most_recent_announcement_date(et_now)
 
     # B) 构造 classification 查询 + 抓取搜索页（含摘要）
     full_query = build_web_query(ARXIV_QUERY, ARXIV_CLASSES, REQUIRE_PHYSICS_GROUP)
     url = build_search_url(full_query, RESULT_SIZE, ORDER, HIDE_ABSTRACTS)
     headers = {"User-Agent": "Mozilla/5.0 (arxiv-feishu-bot; classification-search)"}
-    resp = requests.get(url, headers=headers, timeout=40)
-    resp.raise_for_status()
+    resp_text = _http_get_text(
+        url,
+        headers=headers,
+        timeout=40,
+        fallback_path=SAMPLE_SEARCH_FILE,
+        allow_offline=allow_offline,
+    )
 
     # C) 解析整页 → 仅保留“最新公告日”
-    all_items = parse_all_items(resp.text)
-    items = filter_by_target_date(all_items, target_date)
+    all_items = parse_all_items(resp_text)
+    window_start = None
+    if target_date is not None:
+        window_start = target_date - timedelta(days=ANNOUNCEMENT_WINDOW_DAYS - 1)
+    items = filter_by_date_window(all_items, window_start, target_date)
+    return items, all_items, url, target_date, et_now, full_query, window_start
 
-    # D) 推送
-    to_send = items[:TOP_SEND]
-    payload = build_card(to_send)
-    r = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-    r.raise_for_status()
 
-    print("Feishu response:", r.text)
-    print(f"Localtime ET now: {et_now}  -> latest announcement date: {target_date}")
+def summarize_items(items: List[Dict]) -> str:
+    """生成用于 CLI 打印的概要文本。"""
+    if not items:
+        return "没有符合条件的结果。"
+    lines = []
+    for i, it in enumerate(items, 1):
+        title = it.get("title", "")
+        authors = it.get("authors", "")
+        date_str = it.get("announced_date")
+        date_str = date_str.isoformat() if date_str else "未知日期"
+        cat = it.get("cat", "")
+        lines.append(f"{i}. {title} | {authors} | {date_str} | {cat}")
+    return "\n".join(lines)
+
+
+def _cli_args():
+    parser = argparse.ArgumentParser(description="Fetch arXiv announcements and optionally push to Feishu.")
+    parser.add_argument("--dry-run", action="store_true", help="只打印结果，不推送飞书")
+    parser.add_argument("--top", type=int, default=None, help="限制输出/推送的条数")
+    parser.add_argument("--debug", action="store_true", help="输出额外调试信息，并传递查询参数到飞书")
+    parser.add_argument(
+        "--offline-fallback",
+        dest="offline_fallback",
+        action="store_true",
+        help="网络受限时使用本地样例数据（默认：Dry-run 时启用）",
+    )
+    parser.add_argument(
+        "--no-offline-fallback",
+        dest="offline_fallback",
+        action="store_false",
+        help="禁用离线样例兜底",
+    )
+    parser.set_defaults(offline_fallback=None)
+    return parser.parse_args()
+
+
+def _resolve_offline_flag(cli_flag: Optional[bool], dry_run: bool) -> bool:
+    if cli_flag is not None:
+        return cli_flag
+    if _OFFLINE_ENV in {"1", "true", "yes", "on"}:
+        return True
+    if _OFFLINE_ENV in {"0", "false", "no", "off"}:
+        return False
+    return dry_run
+
+
+def main():
+    args = _cli_args()
+    dry_run = DRY_RUN or args.dry_run
+    debug = DEBUG_MODE or args.debug
+    allow_offline = _resolve_offline_flag(args.offline_fallback, dry_run)
+
+    if not WEBHOOK_URL:
+        if not dry_run:
+            print("缺少 WEBHOOK_URL（飞书 Incoming Webhook）。", flush=True)
+            raise SystemExit(2)
+
+    if allow_offline:
+        print("Offline fallback enabled: 网络失败时将使用样例页面。", flush=True)
+
+    try:
+        (
+            items,
+            all_items,
+            url,
+            target_date,
+            et_now,
+            full_query,
+            window_start,
+        ) = fetch_latest_announcements(allow_offline=allow_offline)
+    except RuntimeError as exc:
+        print(f"拉取数据失败：{exc}", flush=True)
+        raise SystemExit(1)
+
+    top_limit = args.top if args.top is not None else TOP_SEND
+    if top_limit and top_limit > 0:
+        to_process = items[:top_limit]
+    else:
+        to_process = items
+
+    if debug:
+        print(f"[debug] Using query: {full_query}")
+        print(
+            "[debug] Parameters => size: {size}, order: {order}, hide_abstracts: {hide}, "
+            "require_physics_group: {phys}".format(
+                size=RESULT_SIZE,
+                order=ORDER,
+                hide=HIDE_ABSTRACTS,
+                phys=REQUIRE_PHYSICS_GROUP,
+            )
+        )
+        print(
+            "[debug] Announcement window => days: {days}, start: {start}, end: {end}".format(
+                days=ANNOUNCEMENT_WINDOW_DAYS,
+                start=window_start,
+                end=target_date,
+            )
+        )
+
+    print(f"Localtime ET now: {et_now} -> latest announcement date: {target_date}")
+    if window_start:
+        print(f"Collecting announcements from {window_start} to {target_date} (最近 {ANNOUNCEMENT_WINDOW_DAYS} 天)")
     print(f"URL used: {url}")
-    print(f"Parsed {len(all_items)} items; kept {len(items)} on {target_date}; sent {len(to_send)}.")
+    print(
+        "Parsed {total} items; kept {kept} within window; using top {top}.".format(
+            total=len(all_items), kept=len(items), top=len(to_process)
+        )
+    )
+    print("Summary:\n" + summarize_items(to_process))
+
+    if dry_run:
+        print("Dry-run mode: 不推送飞书。")
+        return
+
+    debug_lines = None
+    if debug:
+        debug_lines = [
+            "**Debug 参数**",
+            f"Query: `{full_query}`",
+            f"Size: `{RESULT_SIZE}`  |  Order: `{ORDER}`  |  Hide abstracts: `{HIDE_ABSTRACTS}`",
+            f"Require physics group: `{REQUIRE_PHYSICS_GROUP}`",
+            f"Window days: `{ANNOUNCEMENT_WINDOW_DAYS}`  |  Start: `{window_start}`  |  End: `{target_date}`",
+        ]
+
+    intro_text = None
+    if window_start and target_date:
+        intro_text = f"最近 `{ANNOUNCEMENT_WINDOW_DAYS}` 天（{window_start} → {target_date}）的公告汇总。"
+    header_title = f"arXiv 公告（最近 {ANNOUNCEMENT_WINDOW_DAYS} 天）"
+
+    payload = build_card(
+        to_process,
+        debug_lines=debug_lines,
+        intro_text=intro_text,
+        header_title=header_title,
+    )
+    response_text = _http_post_json(WEBHOOK_URL, payload, timeout=30)
+
+    print("Feishu response:", response_text)
 
 if __name__ == "__main__":
     main()
