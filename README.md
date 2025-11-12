@@ -69,6 +69,7 @@ Update `.github/workflows/arxiv-cron.yml` to set your keyword矩阵与运行频�
 | `HIDE_ABSTRACTS` | `False` | Whether to hide abstracts on arXiv search page |
 | `REQUIRE_PHYSICS_GROUP` | `1` | Restrict to physics main group in classification |
 | `DRY_RUN` | `0` | When truthy, only prints summary instead of pushing to Feishu |
+| `DEBUG` | `0` | Print verbose diagnostics and include query metadata in Feishu cards |
 | `OFFLINE_FALLBACK` | `auto` | `auto` = enable fallback while dry-running; set `1`/`0` to force using or skipping bundled samples |
 | `ANNOUNCEMENT_WINDOW_DAYS` | `7` | 最近多少天的公告会被保留 |
 
@@ -99,6 +100,11 @@ python arxiv_to_feishu.py --dry-run
 export WEBHOOK_URL="https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
 python arxiv_to_feishu.py
 ```
+
+### 🔍 Debug mode
+
+Add `--debug` (or export `DEBUG=1`) to inspect the exact query, search parameters, and announcement window used by the script.
+When Feishu delivery is enabled the additional metadata is appended to the top of the card so operators can verify each run.
 
 ---
 
